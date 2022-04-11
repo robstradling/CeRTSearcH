@@ -1,5 +1,15 @@
 <img src="certsearch.svg" width="200">
 
+# Overview
+
+CeRTSearcH uses the crt.sh database to handle two use cases for which the https://crt.sh/ web interface is not well suited:
+1. Very large result sets. e.g., all dNSName values that match %.com
+2. Delta searches. i.e., what's new since I last searched?
+
+The https://crt.sh/ web interface relies on [Full Text Search](https://www.postgresql.org/docs/current/textsearch.html) indexes to perform a single SQL query over the entire corpus of certificates; in contrast, CeRTSearcH performs multiple sequential SQL queries over adjacent and relatively small ranges of crt.sh IDs.
+
+Given the huge number of certificates known to crt.sh, CeRTSearcH can be expected to take a minimum of several days to search the entire database starting at `-startID 1`. Parallel processing of multiple ranges of crt.sh IDs would be faster, but since it would work the database harder it is deliberately not supported by CeRTSearcH; this is because crt.sh:5432 is a finite resource that is shared between many users.
+
 # Build
 
 ```bash
