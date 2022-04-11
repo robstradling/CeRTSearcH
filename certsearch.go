@@ -1,13 +1,17 @@
 // CeRTSearcH
-//
+// Written by Rob Stradling
+// Copyright (C) 2022 Sectigo Limited
 
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"math"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,51 +25,104 @@ func main() {
 	defer stop()
 
 	// Define and parse flags.
-	var endID int64
-	var startID int64
-	var batchSize int64
-	var unexpiredOnly bool
-	var deduplicate bool
-	var q string
-	var logLevel string
+	var startID, endID, batchSize int64
+	var unexpiredOnly, deduplicate, uniq, sort, showSQLOnly bool
+	var q, subjectType, sanType, logLevel string
+	flag.Int64Var(&startID, "startID", -1, "crt.sh ID to start from [-1 = stream new records, starting at max(ID)+1]")
 	flag.Int64Var(&endID, "endID", math.MaxInt64, "crt.sh ID to stop at")
-	flag.Int64Var(&startID, "startID", -1, "crt.sh ID to start from (-1 = Use max(ID)+1)")
-	flag.Int64Var(&batchSize, "batchSize", 100000, "Number of certificates to process per batch")
+	flag.Int64Var(&batchSize, "batchSize", 100000, "Number of certificate records to process per batch")
 	flag.BoolVar(&unexpiredOnly, "unexpiredOnly", false, "Ignore expired certificates")
-	flag.BoolVar(&deduplicate, "deduplicate", false, "Report first record only for (pre)certificate pairs (Note: ~4x slower)")
-	flag.StringVar(&q, "q", "", "Search term (%=wildcard)")
-	flag.StringVar(&logLevel, "logLevel", "debug", "Logrus log level [debug, info, error, fatal]")
+	flag.BoolVar(&deduplicate, "deduplicate", false, "Report first crt.sh record only for (pre)certificate pairs [note: ~4x slower]")
+	flag.BoolVar(&uniq, "uniq", false, "Remove duplicate results (e.g., identical CN and dNSName in the same certificate)")
+	flag.BoolVar(&sort, "sort", false, "Guarantee results are ordered by crt.sh ID")
+	flag.BoolVar(&showSQLOnly, "showSQLOnly", false, "Show the SQL query that would be used, then exit")
+	flag.StringVar(&q, "q", "%", "Search term [use % for wildcard matching]")
+	flag.StringVar(&subjectType, "subjectType", "NONE", "Subject DN attributes to search [NONE, ANY, <OID>]")
+	flag.StringVar(&sanType, "sanType", "dNSName", "Subject Alternative Name attributes to search [NONE, ANY, rfc822Name, dNSName, iPAddress]")
+	flag.StringVar(&logLevel, "logLevel", "debug", "Logging verbosity [debug, info, error, fatal]")
 	flag.Parse()
 
 	// Configure logrus.
 	var level logrus.Level
 	var err error
 	if level, err = logrus.ParseLevel(logLevel); err != nil {
-		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Could not parse log level")
+		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Invalid log level")
 	}
 	logrus.SetLevel(level)
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 
-	// Parse the connect string URI.
-	var pgxConfig *pgx.ConnConfig
-	if pgxConfig, err = pgx.ParseConfig("postgresql:///certwatch?host=crt.sh&port=5432&application_name=CeRTSearcH&user=guest&statement_cache_mode=describe"); err != nil {
-		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Could not parse connect string URI")
+	// Treat subjectType and sanType case-insensitively.
+	subjectType = strings.ToUpper(subjectType)
+	sanType = strings.ToUpper(sanType)
+
+	// Validate user input.
+	if q == "" {
+		logrus.Fatal("Invalid q")
+	} else if startID > endID {
+		logrus.Fatal("startID must be <= endID")
+	} else if batchSize > 100000 {
+		logrus.Fatal("batchSize must be <=100000")
+	} else if subjectType == "NONE" && sanType == "NONE" {
+		logrus.Fatal("subjectType and sanType cannot both be NONE")
 	}
 
-	// Connect to crt.sh:5432.
-	var crtsh *pgx.Conn
-	if crtsh, err = pgx.ConnectConfig(context.Background(), pgxConfig); err != nil {
-		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Could not connect to crt.sh:5432")
+	switch subjectType {
+	case "NONE", "ANY":
+	default:
+		if matched, err := regexp.MatchString("^[0-9.]*[0-9]$", subjectType); err != nil {
+			logrus.WithFields(logrus.Fields{"err": err}).Fatal("regexp.MatchString error")
+		} else if !matched {
+			logrus.Fatal("Invalid subjectType")
+		}
 	}
-	defer crtsh.Close(context.Background())
+
+	var sanTypeNum int
+	switch sanType {
+	case "NONE", "ANY":
+		sanTypeNum = -1
+	case "RFC822NAME":
+		sanTypeNum = 1
+	case "DNSNAME":
+		sanTypeNum = 2
+	case "IPADDRESS":
+		sanTypeNum = 7
+	default:
+		logrus.Fatal("Invalid sanType")
+	}
 
 	// Construct the query.
-	query := `
-SELECT c.ID, encode(x509_altnames_raw.RAW_VALUE, 'escape'::text), x509_notAfter(c.CERTIFICATE)
-	FROM certificate c, x509_altnames_raw(c.CERTIFICATE)
-	WHERE c.ID BETWEEN $1 AND $2
-		AND x509_altnames_raw.TYPE_NUM = 2
-		AND encode(x509_altnames_raw.RAW_VALUE, 'escape'::text) ILIKE $3` // "TYPE_NUM = 2" means SAN:dNSName.
+	query := `SELECT c.ID, name.IDENTITY, x509_notAfter(c.CERTIFICATE)
+	FROM certificate c
+			LEFT JOIN LATERAL (`
+	if subjectType != "NONE" {
+		query += `
+				SELECT encode(x509_nameattributes_raw.RAW_VALUE, 'escape'::text) AS IDENTITY
+					FROM x509_nameattributes_raw(c.CERTIFICATE)`
+		if subjectType != "ANY" {
+			query += `
+					WHERE x509_nameattributes_raw.ATTRIBUTE_OID = '` + subjectType + `'`
+		}
+	}
+	if sanType != "NONE" {
+		if subjectType != "NONE" {
+			query += `
+				UNION`
+		}
+		query += `
+				SELECT encode(x509_altnames_raw.RAW_VALUE, 'escape'::text) AS IDENTITY
+					FROM x509_altnames_raw(c.CERTIFICATE)`
+		if sanType != "ANY" {
+			query += `
+					WHERE x509_altnames_raw.TYPE_NUM = ` + fmt.Sprintf("%d", sanTypeNum)
+		}
+	}
+	query += `
+		   ) name ON TRUE
+	WHERE c.ID BETWEEN $1 AND $2`
+	if q != "" {
+		query += `
+		AND name.IDENTITY ILIKE $3`
+	}
 	if unexpiredOnly {
 		query += `
 		AND x509_notAfter(c.CERTIFICATE) > now() AT TIME ZONE 'UTC'`
@@ -82,6 +139,33 @@ SELECT c.ID, encode(x509_altnames_raw.RAW_VALUE, 'escape'::text), x509_notAfter(
 				LIMIT 1
 		)`
 	}
+	if uniq {
+		query += `
+		GROUP BY c.ID, name.IDENTITY, x509_notAfter(c.CERTIFICATE)`
+	}
+	if sort {
+		query += `
+		ORDER BY c.ID, name.IDENTITY, x509_notAfter(c.CERTIFICATE)`
+	}
+
+	// If required, display the constructed SQL query then exit.
+	if showSQLOnly {
+		fmt.Println(query + ";")
+		return
+	}
+
+	// Parse the connect string URI.
+	var pgxConfig *pgx.ConnConfig
+	if pgxConfig, err = pgx.ParseConfig("postgresql:///certwatch?host=crt.sh&port=5432&application_name=CeRTSearcH&user=guest&statement_cache_mode=describe"); err != nil {
+		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Could not parse connect string URI")
+	}
+
+	// Connect to crt.sh:5432.
+	var crtsh *pgx.Conn
+	if crtsh, err = pgx.ConnectConfig(context.Background(), pgxConfig); err != nil {
+		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Could not connect to crt.sh:5432")
+	}
+	defer crtsh.Close(context.Background())
 
 	// Main loop: repeatedly run the query to search batches of certificate records.
 	maxCertificateID := int64(-1)
