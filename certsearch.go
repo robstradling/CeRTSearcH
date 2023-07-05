@@ -91,7 +91,7 @@ func main() {
 	}
 
 	// Construct the query.
-	query := `SELECT c.ID, name.IDENTITY, x509_notAfter(c.CERTIFICATE)
+	query := `SELECT c.ID, name.IDENTITY, x509_notAfter(c.CERTIFICATE), x509_subjectName(c.CERTIFICATE)
 	FROM certificate c
 			LEFT JOIN LATERAL (`
 	if subjectType != "NONE" {
@@ -225,15 +225,16 @@ for_loop:
 		// Process results.
 		var n int64
 		var certificateID int64
-		var dNSName string
+		var valueFound string
 		var notAfter time.Time
+		var subjectName string
 		for rows.Next() {
-			if err = rows.Scan(&certificateID, &dNSName, &notAfter); err != nil {
+			if err = rows.Scan(&certificateID, &valueFound, &notAfter, &subjectName); err != nil {
 				logrus.WithFields(logrus.Fields{"err": err}).Error("Could not scan result")
 				break for_loop
 			}
 
-			logrus.WithFields(logrus.Fields{"certificate_id": certificateID, "dns_name": dNSName, "not_after": notAfter}).Info("Record found")
+			logrus.WithFields(logrus.Fields{"certificate_id": certificateID, "value_found": valueFound, "not_after": notAfter, "subject_name": subjectName}).Info("Record found")
 		}
 
 		logrus.WithFields(logrus.Fields{"first": i, "last": i + thisBatchSize - 1, "count": n}).Debug("Batch end")
