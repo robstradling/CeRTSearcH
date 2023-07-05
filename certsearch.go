@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/sirupsen/logrus"
 )
 
@@ -156,7 +156,7 @@ func main() {
 
 	// Parse the connect string URI.
 	var pgxConfig *pgx.ConnConfig
-	if pgxConfig, err = pgx.ParseConfig("postgresql:///certwatch?host=crt.sh&port=5432&application_name=CeRTSearcH&user=guest&statement_cache_mode=describe"); err != nil {
+	if pgxConfig, err = pgx.ParseConfig("postgresql:///certwatch?host=crt.sh&port=5432&application_name=CeRTSearcH&user=guest&default_query_exec_mode=cache_describe"); err != nil {
 		logrus.WithFields(logrus.Fields{"err": err}).Fatal("Could not parse connect string URI")
 	}
 
